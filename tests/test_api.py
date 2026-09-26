@@ -296,3 +296,183 @@ def test_overlaps_invalid_timezone_422():
         "/overlaps", json={"a": {**OVERLAP_A, "timezone": "Not/AZone"}, "b": OVERLAP_B}
     )
     assert resp.status_code == 422
+
+
+# --- POST /daily-occupancy --------------------------------------------------
+
+# 柏林 2026-03-02（周一）09:00 CET = 08:00 UTC，持续 60 分钟
+OCCUPANCY_BASE = {
+    "timezone": "Europe/Berlin",
+    "start_date": "2026-03-02",
+    "end_date": "2026-03-02",
+    "weekdays": [0],
+    "local_time": "09:00",
+    "duration_minutes": 60,
+    "report_timezone": "Europe/Berlin",
+}
+
+
+def test_daily_occupancy_basic():
+    resp = client.post("/daily-occupancy", json=OCCUPANCY_BASE)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "Europe/Berlin",
+        "count": 1,
+        "days": [{"date": "2026-03-02", "minutes": 60.0}],
+    }
+
+
+def test_daily_occupancy_cross_midnight_split_sorted():
+    # UTC 23:00 + 120min，跨两个本地日；结果按日期升序
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "timezone": "UTC",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "weekdays": [3, 4],
+            "local_time": "23:00",
+            "duration_minutes": 120,
+            "report_timezone": "UTC",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 3
+    assert body["days"] == [
+        {"date": "2026-01-01", "minutes": 60.0},
+        {"date": "2026-01-02", "minutes": 120.0},
+        {"date": "2026-01-03", "minutes": 60.0},
+    ]
+
+
+def test_daily_occupancy_report_timezone_shifts_date():
+    # 柏林 09:00 CET = 08:00 UTC，在上海（UTC+8）是当日 16:00；
+    # 而 UTC 23:30 的实例在上海落入次日
+    resp = client.post(
+        "/daily-occupancy",
+        json={**OCCUPANCY_BASE, "report_timezone": "Asia/Shanghai"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["days"] == [{"date": "2026-03-02", "minutes": 60.0}]
+
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "timezone": "UTC",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-01",
+            "weekdays": [3],
+            "local_time": "23:30",
+            "duration_minutes": 60,
+            "report_timezone": "Asia/Shanghai",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["days"] == [{"date": "2026-01-02", "minutes": 60.0}]
+
+
+def test_daily_occupancy_spring_forward_real_minutes():
+    # 纽约 2026-03-07 23:00 EST + 180min，跨春跳（当日 23 小时）：
+    # 03-07 得 60 分钟，03-08 得 120 分钟，按真实 UTC 时长累计
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "timezone": "America/New_York",
+            "start_date": "2026-03-07",
+            "end_date": "2026-03-07",
+            "weekdays": [5],
+            "local_time": "23:00",
+            "duration_minutes": 180,
+            "report_timezone": "America/New_York",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["days"] == [
+        {"date": "2026-03-07", "minutes": 60.0},
+        {"date": "2026-03-08", "minutes": 120.0},
+    ]
+
+
+def test_daily_occupancy_fold_both_counts_overlap_once():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC），各 90 分钟：
+    # 重叠区间只计一次 -> 合并为 [05:30, 08:00) = 150 分钟
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "timezone": "America/New_York",
+            "start_date": "2026-11-01",
+            "end_date": "2026-11-01",
+            "weekdays": [6],
+            "local_time": "01:30",
+            "fold_strategy": "both",
+            "duration_minutes": 90,
+            "report_timezone": "America/New_York",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["days"] == [{"date": "2026-11-01", "minutes": 150.0}]
+
+
+def test_daily_occupancy_no_instances_empty_list():
+    # 纽约 2026-03-08 02:30 不存在，skip 策略下无实例 -> 空列表
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "timezone": "America/New_York",
+            "start_date": "2026-03-08",
+            "end_date": "2026-03-08",
+            "weekdays": [6],
+            "local_time": "02:30",
+            "gap_strategy": "skip",
+            "duration_minutes": 60,
+            "report_timezone": "America/New_York",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "America/New_York",
+        "count": 0,
+        "days": [],
+    }
+
+
+def test_daily_occupancy_invalid_report_timezone_422():
+    resp = client.post(
+        "/daily-occupancy",
+        json={**OCCUPANCY_BASE, "report_timezone": "Not/AZone"},
+    )
+    assert resp.status_code == 422
+
+
+def test_daily_occupancy_reuses_schedule_validation():
+    # 复用现有校验：非法时区 / 逆序区间 / 超 366 天 / 时长越界均 422
+    resp = client.post(
+        "/daily-occupancy", json={**OCCUPANCY_BASE, "timezone": "Not/AZone"}
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            **OCCUPANCY_BASE,
+            "start_date": "2026-04-01",
+            "end_date": "2026-03-01",
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            **OCCUPANCY_BASE,
+            "start_date": "2026-01-01",
+            "end_date": "2027-01-03",
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/daily-occupancy", json={**OCCUPANCY_BASE, "duration_minutes": 0}
+    )
+    assert resp.status_code == 422

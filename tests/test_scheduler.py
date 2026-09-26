@@ -3,7 +3,14 @@
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from app.scheduler import Instance, classify, expand_schedule, find_overlaps
+from app.scheduler import (
+    Instance,
+    classify,
+    expand_schedule,
+    find_overlaps,
+    merge_intervals,
+    occupancy_by_day,
+)
 
 NY = ZoneInfo("America/New_York")
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -195,3 +202,122 @@ def test_find_overlaps_empty_side():
         )
         == []
     )
+
+
+# --- merge_intervals / occupancy_by_day ------------------------------------
+
+UTC = timezone.utc
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _utc(day: int, hh: int, mm: int = 0) -> datetime:
+    return datetime(2026, 1, 1, tzinfo=UTC) + timedelta(
+        days=day - 1, hours=hh, minutes=mm
+    )
+
+
+def test_merge_intervals_overlapping_and_touching():
+    merged = merge_intervals(
+        [
+            (_utc(1, 10), _utc(1, 11)),  # 与上一段相接 -> 并入
+            (_utc(1, 8), _utc(1, 9)),
+            (_utc(1, 8, 30), _utc(1, 10)),  # 与第一段相交 -> 并入
+            (_utc(1, 12), _utc(1, 13)),  # 不相接，独立成段
+        ]
+    )
+    assert merged == [(_utc(1, 8), _utc(1, 11)), (_utc(1, 12), _utc(1, 13))]
+
+
+def test_merge_intervals_empty():
+    assert merge_intervals([]) == []
+
+
+def test_occupancy_by_day_basic():
+    days = occupancy_by_day(
+        instances=[Instance(_utc(1, 8), "normal")],
+        duration_minutes=90,
+        report_tz=ZoneInfo("UTC"),
+    )
+    assert days == [(date(2026, 1, 1), 90.0)]
+
+
+def test_occupancy_by_day_cross_midnight_split():
+    # 23:00 UTC + 120min -> 当日 60 分钟 + 次日 60 分钟
+    days = occupancy_by_day(
+        instances=[Instance(_utc(1, 23), "normal")],
+        duration_minutes=120,
+        report_tz=ZoneInfo("UTC"),
+    )
+    assert days == [(date(2026, 1, 1), 60.0), (date(2026, 1, 2), 60.0)]
+
+
+def test_occupancy_by_day_report_timezone_shifts_date():
+    # 2026-01-01 23:30 UTC + 60min，在上海（UTC+8）是 01-02 07:30-08:30
+    days = occupancy_by_day(
+        instances=[Instance(_utc(1, 23, 30), "normal")],
+        duration_minutes=60,
+        report_tz=SHANGHAI,
+    )
+    assert days == [(date(2026, 1, 2), 60.0)]
+
+
+def test_occupancy_by_day_empty_instances():
+    assert (
+        occupancy_by_day(instances=[], duration_minutes=60, report_tz=ZoneInfo("UTC"))
+        == []
+    )
+
+
+def test_occupancy_by_day_fold_both_counts_overlap_once():
+    # 纽约 2026-11-01 01:30 出现两次：05:30 / 06:30 UTC；各 90 分钟
+    # -> [05:30,07:00) 与 [06:30,08:00) 重叠，合并后 [05:30,08:00) = 150 分钟
+    instances, _ = expand_schedule(
+        tz=NY,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        weekdays={6},
+        local_time=time(1, 30),
+        gap_strategy="skip",
+        fold_strategy="both",
+    )
+    days = occupancy_by_day(
+        instances=instances, duration_minutes=90, report_tz=NY
+    )
+    assert days == [(date(2026, 11, 1), 150.0)]
+
+
+def test_occupancy_by_day_spring_forward_real_minutes():
+    # 纽约 2026-03-07 23:00 EST = 03-08 04:00 UTC，180 分钟
+    # -> 03-08 03:00 EDT（春跳当日仅 23 小时，仍按真实 UTC 时长累计）
+    # 本地午夜 03-08 00:00 EST = 05:00 UTC：03-07 得 60 分钟，03-08 得 120 分钟
+    instances, _ = expand_schedule(
+        tz=NY,
+        start_date=date(2026, 3, 7),
+        end_date=date(2026, 3, 7),
+        weekdays={5},
+        local_time=time(23, 0),
+        gap_strategy="skip",
+        fold_strategy="first",
+    )
+    days = occupancy_by_day(
+        instances=instances, duration_minutes=180, report_tz=NY
+    )
+    assert days == [(date(2026, 3, 7), 60.0), (date(2026, 3, 8), 120.0)]
+
+
+def test_occupancy_by_day_fall_back_day_real_minutes():
+    # 纽约 2026-11-01 00:30 EDT = 04:30 UTC，120 分钟 -> 02:30 EST
+    # 跨越秋回（当日 25 小时），仍按真实 120 分钟计入 11-01
+    instances, _ = expand_schedule(
+        tz=NY,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        weekdays={6},
+        local_time=time(0, 30),
+        gap_strategy="skip",
+        fold_strategy="first",
+    )
+    days = occupancy_by_day(
+        instances=instances, duration_minutes=120, report_tz=NY
+    )
+    assert days == [(date(2026, 11, 1), 120.0)]

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Literal
+from typing import Iterable, Literal
 from zoneinfo import ZoneInfo
 
 Kind = Literal["normal", "fold", "gap"]
@@ -169,6 +169,54 @@ def find_overlaps(
 
     overlaps.sort(key=lambda o: (o.start, o.end, o.a_start, o.b_start))
     return overlaps
+
+
+def merge_intervals(
+    intervals: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """合并相交或相接的半开区间，返回按起点排序的两两不相交区间。"""
+    merged: list[list[datetime]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:  # 相交或相接：并入上一段
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def occupancy_by_day(
+    *,
+    instances: list[Instance],
+    duration_minutes: int,
+    report_tz: ZoneInfo,
+) -> list[tuple[date, float]]:
+    """按报告时区的本地日界统计逐日占用分钟数。
+
+    每个实例解释为半开 UTC 区间 [utc, utc+duration)，先合并相交或相接的
+    区间（重复时刻产生的重叠只计一次），再按 report_tz 的本地日界切分。
+    时长按真实 UTC 流逝累计：跨午夜自然落到相邻两日，夏令时切换日仍按
+    实际经过的分钟数计。返回 [(本地日期, 分钟数)]，按日期升序。
+    """
+    span = timedelta(minutes=duration_minutes)
+    merged = merge_intervals((i.utc, i.utc + span) for i in instances)
+
+    minutes_by_day: dict[date, float] = {}
+    one_day = timedelta(days=1)
+    for start, end in merged:
+        cursor = start
+        while cursor < end:
+            local = cursor.astimezone(report_tz)
+            # 下一个本地午夜对应的 UTC 时刻（切换日不足/超过 24h 均按实际）
+            next_midnight = datetime.combine(
+                local.date() + one_day, time.min, tzinfo=report_tz
+            ).astimezone(timezone.utc)
+            segment_end = min(end, next_midnight)
+            minutes = (segment_end - cursor).total_seconds() / 60
+            minutes_by_day[local.date()] = (
+                minutes_by_day.get(local.date(), 0.0) + minutes
+            )
+            cursor = segment_end
+    return sorted(minutes_by_day.items())
 
 
 def utc_iso(dt: datetime) -> str:

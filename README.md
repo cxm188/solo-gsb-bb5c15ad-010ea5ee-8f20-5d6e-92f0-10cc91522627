@@ -4,7 +4,8 @@
 星期集合与本地时刻，服务通过 **UTC 往返校验**区分正常 / 跳时（gap）/ 叠时（fold），
 按指定策略生成**去重且按 UTC 稳定排序**的实例，并返回每个实例的本地时间、UTC 偏移、
 UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各附加时长，
-用**扫描线**检测它们在真实时间轴上的全部冲突。
+用**扫描线**检测它们在真实时间轴上的全部冲突；`POST /daily-occupancy`
+则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数。
 
 ## 快速启动（单条命令）
 
@@ -17,6 +18,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`
 
 ## 配置
 
@@ -142,14 +144,67 @@ docker compose up --build
 
 每侧的日期区间同样限制为不超过 366 天，校验失败返回 422。
 
+### `POST /daily-occupancy`
+
+统计单个日程在报告时区内的逐日占用时长。请求体与 `/overlaps` 单侧相同
+（全部 `/expand` 展开参数 + `duration_minutes`），外加 `report_timezone`。
+实例按既有策略展开后，每个实例解释为**半开 UTC 区间**
+`[start, start+duration)`；先**合并相交或相接的区间**（重复时刻产生的
+重叠只计一次），再按报告时区的**本地日界**切分，逐日返回占用的真实分钟数。
+跨午夜自然落到相邻两日；夏令时切换日（23 / 25 小时）仍按实际 UTC 流逝累计。
+无实例时 `days` 为空列表。
+
+请求体：
+
+```json
+{
+  "timezone": "America/New_York",
+  "start_date": "2026-03-07",
+  "end_date": "2026-03-07",
+  "weekdays": [5],
+  "local_time": "23:00",
+  "duration_minutes": 180,
+  "report_timezone": "America/New_York"
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| （展开参数） | — | 与 `/expand` 请求字段相同，校验规则一致 |
+| `duration_minutes` | int | 每次实例的时长（分钟），`1`～`1440` |
+| `report_timezone` | string | 报告时区（IANA 名），按该时区的本地日界切分 |
+
+响应 `200`（`days` 按日期升序）：
+
+```json
+{
+  "report_timezone": "America/New_York",
+  "count": 2,
+  "days": [
+    {"date": "2026-03-07", "minutes": 60.0},
+    {"date": "2026-03-08", "minutes": 120.0}
+  ]
+}
+```
+
+上例中实例为纽约 2026-03-07 23:00 EST（= 03-08 04:00 UTC）起 180 分钟，
+跨越春跳（03-08 当日仅 23 小时），仍按真实 UTC 时长计入两日。
+
+| 字段 | 说明 |
+| --- | --- |
+| `report_timezone` | 报告时区 |
+| `count` | 有占用的天数 |
+| `days[].date` | 报告时区的本地日期（YYYY-MM-DD） |
+| `days[].minutes` | 当日占用的真实分钟数 |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
 
-- 非法 IANA 时区名
+- 非法 IANA 时区名（含 `/daily-occupancy` 的 `report_timezone`）
 - `end_date` 早于 `start_date`（逆序区间）
 - 区间超过 366 天（`(end_date - start_date).days > 366`，`/overlaps` 对每侧分别限制）
-- `duration_minutes` 不在 1～1440（仅 `/overlaps`）
+- `duration_minutes` 不在 1～1440（仅 `/overlaps` 与 `/daily-occupancy`）
 - 星期值越界（不在 0–6）或集合为空等其他字段校验失败
 
 ## 判定原理
@@ -172,9 +227,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

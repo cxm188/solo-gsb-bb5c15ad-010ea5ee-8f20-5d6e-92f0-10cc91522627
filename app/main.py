@@ -6,8 +6,21 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 
-from .models import ExpandRequest, ExpandResponse, OverlapRequest, OverlapResponse
-from .scheduler import expand_schedule, find_overlaps, instance_payload, utc_iso
+from .models import (
+    DailyOccupancyRequest,
+    DailyOccupancyResponse,
+    ExpandRequest,
+    ExpandResponse,
+    OverlapRequest,
+    OverlapResponse,
+)
+from .scheduler import (
+    expand_schedule,
+    find_overlaps,
+    instance_payload,
+    occupancy_by_day,
+    utc_iso,
+)
 
 app = FastAPI(
     title="Civil Schedule Expander",
@@ -16,7 +29,7 @@ app = FastAPI(
         "基于标准库 zoneinfo 的民用日程展开 API："
         "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
         "按策略生成去重且按 UTC 稳定排序的实例，"
-        "并可检测两个日程在真实时间轴上的重叠。"
+        "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用。"
     ),
 )
 
@@ -81,4 +94,32 @@ def overlaps(req: OverlapRequest) -> OverlapResponse:
             }
             for o in found
         ],
+    )
+
+
+@app.post(
+    "/daily-occupancy",
+    response_model=DailyOccupancyResponse,
+    summary="按报告时区统计逐日占用分钟数",
+)
+def daily_occupancy(req: DailyOccupancyRequest) -> DailyOccupancyResponse:
+    tz = ZoneInfo(req.timezone)
+    instances, _ = expand_schedule(
+        tz=tz,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        weekdays=req.weekdays,
+        local_time=req.local_time,
+        gap_strategy=req.gap_strategy.value,
+        fold_strategy=req.fold_strategy.value,
+    )
+    days = occupancy_by_day(
+        instances=instances,
+        duration_minutes=req.duration_minutes,
+        report_tz=ZoneInfo(req.report_timezone),
+    )
+    return DailyOccupancyResponse(
+        report_timezone=req.report_timezone,
+        count=len(days),
+        days=[{"date": d.isoformat(), "minutes": m} for d, m in days],
     )

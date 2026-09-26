@@ -16,6 +16,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MAX_RANGE_DAYS = 366
 
 
+def _check_iana_timezone(v: str) -> str:
+    """校验 IANA 时区名，非法时抛 ValueError（由 FastAPI 转为 422）。"""
+    try:
+        ZoneInfo(v)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        raise ValueError(f"unknown IANA timezone: {v!r}") from None
+    return v
+
+
 class GapStrategy(str, Enum):
     """本地时刻不存在（春跳）时的策略。"""
 
@@ -53,11 +62,7 @@ class ExpandRequest(BaseModel):
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, v: str) -> str:
-        try:
-            ZoneInfo(v)
-        except (ZoneInfoNotFoundError, KeyError, ValueError):
-            raise ValueError(f"unknown IANA timezone: {v!r}") from None
-        return v
+        return _check_iana_timezone(v)
 
     @model_validator(mode="after")
     def _validate_range(self) -> "ExpandRequest":
@@ -118,4 +123,34 @@ class OverlapResponse(BaseModel):
     count: int = Field(..., description="跨侧重叠次数")
     overlaps: list[OverlapOut] = Field(
         ..., description="全部跨侧重叠，按 overlap_start_utc 排序"
+    )
+
+
+class DailyOccupancyRequest(OverlapSide):
+    """逐日占用统计请求：与 /overlaps 单侧相同的日程 + 报告时区。
+
+    继承 OverlapSide 的全部校验（合法时区、顺序区间、不超过 366 天、
+    duration_minutes 1～1440 等）。
+    """
+
+    report_timezone: str = Field(
+        ..., description="报告时区（IANA 名），按该时区的本地日界切分"
+    )
+
+    @field_validator("report_timezone")
+    @classmethod
+    def _validate_report_timezone(cls, v: str) -> str:
+        return _check_iana_timezone(v)
+
+
+class DayOccupancyOut(BaseModel):
+    date: str = Field(..., description="报告时区的本地日期，YYYY-MM-DD")
+    minutes: float = Field(..., description="当日占用的真实分钟数")
+
+
+class DailyOccupancyResponse(BaseModel):
+    report_timezone: str = Field(..., description="报告时区")
+    count: int = Field(..., description="有占用的天数")
+    days: list[DayOccupancyOut] = Field(
+        ..., description="逐日占用分钟数，按日期升序；无实例时为空列表"
     )
