@@ -3,7 +3,14 @@
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from app.scheduler import Instance, classify, expand_schedule, find_overlaps
+from app.scheduler import (
+    Instance,
+    classify,
+    daily_occupancy,
+    expand_schedule,
+    find_overlaps,
+    merge_intervals,
+)
 
 NY = ZoneInfo("America/New_York")
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -195,3 +202,105 @@ def test_find_overlaps_empty_side():
         )
         == []
     )
+
+
+# --- merge_intervals --------------------------------------------------------
+
+def test_merge_intervals_overlapping_and_touching():
+    intervals = [
+        (datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc),
+         datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)),
+        (datetime(2026, 1, 1, 10, 30, tzinfo=timezone.utc),  # 相交
+         datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)),
+        (datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),  # 相接也合并
+         datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc)),
+        (datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc),  # 有间隙，独立
+         datetime(2026, 1, 2, 1, 0, tzinfo=timezone.utc)),
+    ]
+    assert merge_intervals(intervals) == [
+        (datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc),
+         datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc)),
+        (datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc),
+         datetime(2026, 1, 2, 1, 0, tzinfo=timezone.utc)),
+    ]
+
+
+def test_merge_intervals_empty():
+    assert merge_intervals([]) == []
+
+
+# --- daily_occupancy --------------------------------------------------------
+
+def _occ(insts, minutes, tz):
+    return [(d, float(m)) for d, m in daily_occupancy(
+        instances=insts, duration_minutes=minutes, report_tz=tz
+    )]
+
+
+def test_daily_occupancy_cross_midnight_utc():
+    # [23:00, 24:00) 与 [23:30, 00:30) 合并为 [23:00, 00:30)
+    insts = [_inst(23), _inst(23, 30)]
+    assert _occ(insts, 60, timezone.utc) == [
+        (date(2026, 1, 1), 60.0),
+        (date(2026, 1, 2), 30.0),
+    ]
+
+
+def test_daily_occupancy_empty():
+    assert daily_occupancy(
+        instances=[], duration_minutes=60, report_tz=timezone.utc
+    ) == []
+
+
+def test_daily_occupancy_gap_day_is_23_hours():
+    # 纽约春跳日：01:00 EST(06:00 UTC) 起 1440 分钟，至次日 06:00 UTC；
+    # 本地日界 05:00 UTC -> 次日 04:00 UTC（短日）
+    inst = Instance(datetime(2026, 3, 8, 6, 0, tzinfo=timezone.utc), "normal")
+    assert _occ([inst], 1440, NY) == [
+        (date(2026, 3, 8), 1320.0),  # 01:00 至本地午夜（短日 23h 少 1h）
+        (date(2026, 3, 9), 120.0),
+    ]
+
+
+def test_daily_occupancy_fold_day_is_25_hours():
+    # 纽约秋回日：00:00 EDT(04:00 UTC) 起 1560 分钟，至次日 06:00 UTC
+    # （本地 01:00 EST）；长日本地午夜在 05:00 UTC
+    inst = Instance(datetime(2026, 11, 1, 4, 0, tzinfo=timezone.utc), "normal")
+    assert _occ([inst], 1560, NY) == [
+        (date(2026, 11, 1), 1500.0),  # 整个 25 小时本地日占满
+        (date(2026, 11, 2), 60.0),
+    ]
+
+
+def test_daily_occupancy_fold_both_overlap_counted_once():
+    # 01:30 的两次出现，各 60 分钟：[05:30,06:30) 与 [06:30,07:30)
+    # 相接合并为 120 分钟；本地 01:00–03:30 共 150 分钟内占用 120
+    insts, _ = expand_schedule(
+        tz=NY,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        weekdays={6},
+        local_time=time(1, 30),
+        gap_strategy="skip",
+        fold_strategy="both",
+    )
+    assert _occ(insts, 60, NY) == [(date(2026, 11, 1), 120.0)]
+
+
+def test_daily_occupancy_two_25h_days_merge_continues():
+    # 秋回前后各一次 1500 分钟：00:00 EDT [04:00 UTC, +25h=05:00 UTC 次日)
+    # 与次日 00:00 EST [05:00 UTC, 06:00 UTC) 相接，合并为连续 50 小时
+    insts, _ = expand_schedule(
+        tz=NY,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 2),
+        weekdays={6, 0},
+        local_time=time(0, 0),
+        gap_strategy="skip",
+        fold_strategy="first",
+    )
+    assert _occ(insts, 1500, NY) == [
+        (date(2026, 11, 1), 1500.0),  # 25 小时本地日占满
+        (date(2026, 11, 2), 1440.0),  # 普通 24 小时日占满
+        (date(2026, 11, 3), 60.0),
+    ]

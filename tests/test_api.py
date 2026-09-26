@@ -296,3 +296,151 @@ def test_overlaps_invalid_timezone_422():
         "/overlaps", json={"a": {**OVERLAP_A, "timezone": "Not/AZone"}, "b": OVERLAP_B}
     )
     assert resp.status_code == 422
+
+
+# --- POST /daily-occupancy --------------------------------------------------
+
+# 柏林 23:00 CET（=22:00 UTC），持续 180 分钟，同时越过柏林与 UTC 午夜，
+# 但两种日界的切点不同
+DAILY_SCHEDULE = {
+    "timezone": "Europe/Berlin",
+    "start_date": "2026-03-02",
+    "end_date": "2026-03-02",
+    "weekdays": [0],
+    "local_time": "23:00",
+    "duration_minutes": 180,
+}
+
+
+def test_daily_occupancy_cross_midnight_by_report_tz():
+    # 实例 [22:00, 01:00) UTC；本地 23:00–次日 02:00，按柏林日界 60/120
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": DAILY_SCHEDULE, "report_timezone": "Europe/Berlin"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "Europe/Berlin",
+        "count": 2,
+        "days": [
+            {"date": "2026-03-02", "minutes": 60.0},
+            {"date": "2026-03-03", "minutes": 120.0},
+        ],
+    }
+
+    # 同一实例按 UTC 日界切分则为 120/60
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": DAILY_SCHEDULE, "report_timezone": "UTC"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "UTC",
+        "count": 2,
+        "days": [
+            {"date": "2026-03-02", "minutes": 120.0},
+            {"date": "2026-03-03", "minutes": 60.0},
+        ],
+    }
+
+
+def test_daily_occupancy_fold_both_overlap_once():
+    # 纽约秋回 01:30 两次出现，各 60 分钟且首尾相接：合计 120 分钟，
+    # 落在同一个本地日，重复区间不重复计时
+    schedule = {
+        "timezone": "America/New_York",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "weekdays": [6],
+        "local_time": "01:30",
+        "fold_strategy": "both",
+        "duration_minutes": 60,
+    }
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": schedule, "report_timezone": "America/New_York"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "America/New_York",
+        "count": 1,
+        "days": [{"date": "2026-11-01", "minutes": 120.0}],
+    }
+
+
+def test_daily_occupancy_spring_forward_day_23_hours():
+    # 纽约春跳日 01:00 EST(06:00 UTC) 起 24 小时：短日本地午夜 05:00 UTC
+    schedule = {
+        "timezone": "America/New_York",
+        "start_date": "2026-03-08",
+        "end_date": "2026-03-08",
+        "weekdays": [6],
+        "local_time": "01:00",
+        "gap_strategy": "skip",
+        "duration_minutes": 1440,
+    }
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": schedule, "report_timezone": "America/New_York"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "America/New_York",
+        "count": 2,
+        "days": [
+            {"date": "2026-03-08", "minutes": 1320.0},
+            {"date": "2026-03-09", "minutes": 120.0},
+        ],
+    }
+
+
+def test_daily_occupancy_no_instances_empty_days():
+    # 春跳不存在时刻 + skip 策略 -> 无实例 -> 空列表
+    schedule = {
+        "timezone": "America/New_York",
+        "start_date": "2026-03-08",
+        "end_date": "2026-03-08",
+        "weekdays": [6],
+        "local_time": "02:30",
+        "gap_strategy": "skip",
+        "duration_minutes": 60,
+    }
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": schedule, "report_timezone": "UTC"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "report_timezone": "UTC",
+        "count": 0,
+        "days": [],
+    }
+
+
+def test_daily_occupancy_invalid_report_timezone_422():
+    resp = client.post(
+        "/daily-occupancy",
+        json={"schedule": DAILY_SCHEDULE, "report_timezone": "Not/AZone"},
+    )
+    assert resp.status_code == 422
+
+
+def test_daily_occupancy_reuses_side_validation_422():
+    # 复用 /overlaps 单侧的全部校验：时长范围、时区、日期区间等
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "schedule": {**DAILY_SCHEDULE, "duration_minutes": 0},
+            "report_timezone": "UTC",
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/daily-occupancy",
+        json={
+            "schedule": {**DAILY_SCHEDULE, "timezone": "Not/AZone"},
+            "report_timezone": "UTC",
+        },
+    )
+    assert resp.status_code == 422

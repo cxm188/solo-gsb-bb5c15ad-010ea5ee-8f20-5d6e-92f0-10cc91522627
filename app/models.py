@@ -119,3 +119,36 @@ class OverlapResponse(BaseModel):
     overlaps: list[OverlapOut] = Field(
         ..., description="全部跨侧重叠，按 overlap_start_utc 排序"
     )
+
+
+class DailyOccupancyRequest(BaseModel):
+    """单日日程的占用统计请求：与 /overlaps 单侧相同的展开参数 + 报告时区。"""
+
+    schedule: OverlapSide = Field(
+        ..., description="日程参数（与 /overlaps 的单侧相同，含 duration_minutes）"
+    )
+    report_timezone: str = Field(
+        ..., description="按本地日界切分的报告时区，IANA 名，如 Asia/Shanghai"
+    )
+
+    @field_validator("report_timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            raise ValueError(f"unknown IANA timezone: {v!r}") from None
+        return v
+
+
+class DailyOccupancyOut(BaseModel):
+    date: str = Field(..., description="报告时区本地日期（ISO 8601）")
+    minutes: float = Field(..., description="该日被占用的真实分钟数")
+
+
+class DailyOccupancyResponse(BaseModel):
+    report_timezone: str
+    count: int = Field(..., description="存在占用的日期数")
+    days: list[DailyOccupancyOut] = Field(
+        ..., description="逐日占用，按日期升序；无实例时为空列表"
+    )

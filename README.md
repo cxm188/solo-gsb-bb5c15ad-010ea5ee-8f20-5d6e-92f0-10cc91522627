@@ -4,7 +4,9 @@
 星期集合与本地时刻，服务通过 **UTC 往返校验**区分正常 / 跳时（gap）/ 叠时（fold），
 按指定策略生成**去重且按 UTC 稳定排序**的实例，并返回每个实例的本地时间、UTC 偏移、
 UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各附加时长，
-用**扫描线**检测它们在真实时间轴上的全部冲突。
+用**扫描线**检测它们在真实时间轴上的全部冲突；`POST /daily-occupancy` 则把
+单侧日程的实例展开为 UTC 半开区间，合并相交/相接区间后，按**报告时区的本地日界**
+逐日统计真实占用分钟数（跨午夜与夏令时切换均按实际 UTC 时长计算）。
 
 ## 快速启动（单条命令）
 
@@ -142,14 +144,77 @@ docker compose up --build
 
 每侧的日期区间同样限制为不超过 366 天，校验失败返回 422。
 
+### `POST /daily-occupancy`
+
+按**报告时区的本地日界**统计单侧日程逐日占用的真实分钟数。请求体的 `schedule`
+携带与 `/overlaps` 单侧**完全相同**的字段（全部 `/expand` 展开参数 +
+`duration_minutes`），另加 `report_timezone` 指定按哪个时区的本地午夜切日。
+
+处理流程：
+
+1. 复用现有展开策略（gap / fold 策略、UTC 去重、UTC 排序）生成实例；
+2. 每次实例解释为**半开 UTC 区间** `[start, start+duration)`；
+3. 先**合并相交或相接**的区间（重复时刻 `fold=both` 产生的重叠只计一次）；
+4. 再按 `report_timezone` 的本地日界切分，逐段以**实际 UTC 时长**累计。
+
+因此跨午夜、春跳（本地日 23 小时）、秋回（本地日 25 小时）都按真实经过时间
+计入相应日期；结果仅包含存在占用的日期、按日期升序；无实例（如全部被
+`skip` 跳过）时返回空列表。
+
+请求体：
+
+```json
+{
+  "schedule": {
+    "timezone": "America/New_York",
+    "start_date": "2026-03-08",
+    "end_date": "2026-03-08",
+    "weekdays": [6],
+    "local_time": "01:00",
+    "duration_minutes": 1440
+  },
+  "report_timezone": "America/New_York"
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `schedule` | object | 单侧日程：全部 `/expand` 请求字段 + `duration_minutes`（1～1440），校验规则与 `/overlaps` 单侧一致 |
+| `report_timezone` | string | 按本地日界切分的报告 IANA 时区，如 `Asia/Shanghai`；可与日程时区不同 |
+
+响应 `200`（上例为纽约春跳日：本地日仅 23 小时，01:00 起的 24 小时区间
+有 60 分钟溢出到次日；`days` 按日期升序）：
+
+```json
+{
+  "report_timezone": "America/New_York",
+  "count": 2,
+  "days": [
+    {"date": "2026-03-08", "minutes": 1320.0},
+    {"date": "2026-03-09", "minutes": 120.0}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `report_timezone` | 回显报告时区 |
+| `count` | 存在占用的日期数（无实例时为 `0`） |
+| `days` | 逐日占用，元素为 `{"date", "minutes"}`，按 `date` 升序；无实例时为 `[]` |
+| `date` | 报告时区本地日期（ISO 8601） |
+| `minutes` | 该日被占用的真实分钟数（合并后、按 UTC 实际时长累计） |
+
+`schedule` 与 `report_timezone` 复用现有校验，任何非法时区、逆序/超长区间、
+非法星期、`duration_minutes` 越界等均返回 422。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
 
-- 非法 IANA 时区名
+- 非法 IANA 时区名（`/daily-occupancy` 对日程时区与 `report_timezone` 分别校验）
 - `end_date` 早于 `start_date`（逆序区间）
-- 区间超过 366 天（`(end_date - start_date).days > 366`，`/overlaps` 对每侧分别限制）
-- `duration_minutes` 不在 1～1440（仅 `/overlaps`）
+- 区间超过 366 天（`(end_date - start_date).days > 366`，`/overlaps` 对每侧分别限制，`/daily-occupancy` 对 `schedule` 限制）
+- `duration_minutes` 不在 1～1440（`/overlaps` 两侧及 `/daily-occupancy` 的 `schedule`）
 - 星期值越界（不在 0–6）或集合为空等其他字段校验失败
 
 ## 判定原理
@@ -172,9 +237,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 区间合并 / 逐日占用
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

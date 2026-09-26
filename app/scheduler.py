@@ -171,6 +171,73 @@ def find_overlaps(
     return overlaps
 
 
+def merge_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """合并相交或相接的半开 UTC 区间。
+
+    相接（前一区间终点 == 后一区间起点）也合并：半开区间在该点并无重复
+    计时，合并不改变占用时长，而重复时刻（fold=both）等造成的重叠只计一次。
+    返回按起点排序、互不相交且互不相接的区间列表。
+    """
+    ordered = sorted(intervals)
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            last_start, last_end = merged[-1]
+            if end > last_end:
+                merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def daily_occupancy(
+    *,
+    instances: list[Instance],
+    duration_minutes: int,
+    report_tz: ZoneInfo,
+) -> list[tuple[date, float]]:
+    """统计逐日占用的真实分钟数。
+
+    每个实例解释为半开 UTC 区间 [start, start+duration)；先合并相交或相接
+    的区间（重叠只计一次），再按 report_tz 的本地午夜切分。每段均以 UTC
+    实际时长累计，因此跨午夜与夏令时切换（本地日可能为 23/25 小时）都按
+    真实经过的时间计算。返回 (本地日期, 分钟) 列表，按日期升序，
+    仅包含存在占用的日期；无实例时返回空列表。
+    """
+    span = timedelta(minutes=duration_minutes)
+    intervals = [(i.utc, i.utc + span) for i in instances]
+
+    totals: dict[date, float] = {}
+    for start, end in merge_intervals(intervals):
+        day = start.astimezone(report_tz).date()
+        while True:
+            # 报告时区本地日界（00:00）对应的 UTC 时刻；DST 切换日相邻
+            # 日界间距为 23/25 小时，故切分天然按实际 UTC 时长累计。
+            day_start = datetime.combine(
+                day, time.min, tzinfo=report_tz
+            ).astimezone(timezone.utc)
+            next_day = day + timedelta(days=1)
+            day_end = datetime.combine(
+                next_day, time.min, tzinfo=report_tz
+            ).astimezone(timezone.utc)
+
+            seg_start = start if start > day_start else day_start
+            seg_end = end if end < day_end else day_end
+            if seg_start < seg_end:
+                totals[day] = (
+                    totals.get(day, 0.0)
+                    + (seg_end - seg_start).total_seconds() / 60
+                )
+
+            if end <= day_end:  # 半开：终点恰好落在日界时不占用下一日
+                break
+            day = next_day
+
+    return sorted(totals.items())
+
+
 def utc_iso(dt: datetime) -> str:
     """把 UTC 时刻格式化为 Z 结尾的 ISO 8601 字符串。"""
     return dt.isoformat().replace("+00:00", "Z")
